@@ -1,10 +1,11 @@
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
-import hashlib, json, secrets, sqlite3, time
+import cgi, hashlib, json, secrets, sqlite3, time, uuid
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "chat.db"
+UPLOADS = ROOT / "uploads"
 PORT = 4200
 
 def conn():
@@ -13,12 +14,16 @@ def conn():
     return db
 
 def setup():
+    UPLOADS.mkdir(exist_ok=True)
     with conn() as db:
         db.executescript("""
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, password TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, body TEXT NOT NULL, attachment_path TEXT NOT NULL DEFAULT '', attachment_name TEXT NOT NULL DEFAULT '', attachment_type TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
         """)
+        columns = [row[1] for row in db.execute("PRAGMA table_info(messages)")]
+        for name in ("attachment_path", "attachment_name", "attachment_type"):
+            if name not in columns: db.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
 def digest(value, salt=None):
     salt = salt or secrets.token_bytes(16)
@@ -55,7 +60,7 @@ class App(SimpleHTTPRequestHandler):
         elif path == "/api/messages":
             if self.require():
                 with conn() as db:
-                    rows = db.execute("SELECT messages.id,messages.body,messages.created_at,users.name,users.role,users.id user_id FROM messages JOIN users ON users.id=messages.user_id ORDER BY messages.id DESC LIMIT 200").fetchall()
+                    rows = db.execute("SELECT messages.id,messages.body,messages.attachment_path,messages.attachment_name,messages.attachment_type,messages.created_at,users.name,users.role,users.id user_id FROM messages JOIN users ON users.id=messages.user_id ORDER BY messages.id DESC LIMIT 200").fetchall()
                 self.json(list(reversed([dict(row) for row in rows])))
         else: super().do_GET()
 
@@ -85,10 +90,19 @@ class App(SimpleHTTPRequestHandler):
             elif path == "/api/messages":
                 user=self.require()
                 if user:
-                    body=self.data().get("body","").strip()
-                    if not body or len(body)>2000: raise ValueError("Le message doit contenir entre 1 et 2 000 caractères.")
-                    with conn() as db: db.execute("INSERT INTO messages(user_id,body,created_at) VALUES(?,?,?)",(user["id"],body,int(time.time())))
+                    data=self.data(); body=data.get("body","").strip(); attachment=data.get("attachment") or {}
+                    if len(body)>2000 or (not body and not attachment.get("path")): raise ValueError("Ajoutez un message ou un fichier (message limité à 2 000 caractères).")
+                    with conn() as db: db.execute("INSERT INTO messages(user_id,body,attachment_path,attachment_name,attachment_type,created_at) VALUES(?,?,?,?,?,?)",(user["id"],body,attachment.get("path",""),attachment.get("name",""),attachment.get("type",""),int(time.time())))
                     self.json({"ok":True},201)
+            elif path == "/api/upload":
+                user=self.require()
+                if user:
+                    form=cgi.FieldStorage(fp=self.rfile,headers=self.headers,environ={"REQUEST_METHOD":"POST","CONTENT_TYPE":self.headers.get("Content-Type","")})
+                    item=form["file"]; content=item.file.read(10*1024*1024+1)
+                    if len(content)>10*1024*1024: raise ValueError("Le fichier ne doit pas dépasser 10 Mo.")
+                    name=Path(item.filename or "fichier").name
+                    stored=f"{uuid.uuid4().hex}_{name}"; (UPLOADS/stored).write_bytes(content)
+                    self.json({"path":f"/uploads/{stored}","name":name,"type":item.type or "application/octet-stream"},201)
             else: self.send_error(404)
         except sqlite3.IntegrityError: self.json({"error":"Cet identifiant est déjà utilisé."},400)
         except Exception as error: self.json({"error":str(error)},400)
