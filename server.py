@@ -1,7 +1,7 @@
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
-import cgi, hashlib, json, secrets, sqlite3, time, uuid
+import cgi, hashlib, hmac, json, os, secrets, sqlite3, time, uuid
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "chat.db"
@@ -103,6 +103,14 @@ class App(SimpleHTTPRequestHandler):
                     name=Path(item.filename or "fichier").name
                     stored=f"{uuid.uuid4().hex}_{name}"; (UPLOADS/stored).write_bytes(content)
                     self.json({"path":f"/uploads/{stored}","name":name,"type":item.type or "application/octet-stream"},201)
+            elif path == "/api/admin/reset":
+                pin = self.data().get("pin", "")
+                admin_pin = os.environ.get("CHAT_ADMIN_PIN", "")
+                if not admin_pin or not hmac.compare_digest(pin, admin_pin): raise ValueError("Code administrateur incorrect.")
+                with conn() as db: db.execute("DELETE FROM messages")
+                for file in UPLOADS.iterdir():
+                    if file.is_file(): file.unlink()
+                self.json({"ok": True})
             else: self.send_error(404)
         except sqlite3.IntegrityError: self.json({"error":"Cet identifiant est déjà utilisé."},400)
         except Exception as error: self.json({"error":str(error)},400)
